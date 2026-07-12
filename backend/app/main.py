@@ -137,10 +137,18 @@ async def get_level_timeseries(notation: str):
     site_stats = _flatten_stats_row(stats_rs[0].asdict()) if len(stats_rs) else None
     await db.close()
 
+    sync_pending = False
     if not readings:
-        # Nightly job hasn't reached this site yet - fetch live, don't persist.
-        async with httpx.AsyncClient(timeout=45.0) as http_client:
-            fetched = await fetch_level_readings(http_client, notation)
+        # Nightly job hasn't reached this site yet - try a live fetch, don't
+        # persist. The EA APIs are sometimes very slow (tens of seconds) for
+        # sites with a lot of history, so bound the wait and fail soft rather
+        # than hanging the request past Vercel's function timeout.
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as http_client:
+                fetched = await fetch_level_readings(http_client, notation)
+        except httpx.HTTPError:
+            fetched = []
+            sync_pending = True
         readings = [{**r, "is_outlier": False} for r in fetched]
         values = [r["value"] for r in readings if r["value"] is not None]
         dates = [r["date_time"] for r in readings if r["value"] is not None]
@@ -159,7 +167,7 @@ async def get_level_timeseries(notation: str):
                 ),
             }
 
-    return {"notation": notation, "readings": readings, "stats": site_stats}
+    return {"notation": notation, "readings": readings, "stats": site_stats, "sync_pending": sync_pending}
 
 
 @app.get("/api/sites/quality/{notation}/timeseries")
@@ -189,10 +197,20 @@ async def get_quality_timeseries(notation: str):
     site_stats = [_flatten_stats_row(r.asdict()) for r in stats_rs]
     await db.close()
 
+    sync_pending = False
     if not observations:
-        # Nightly job hasn't reached this site yet - fetch live, don't persist.
-        async with httpx.AsyncClient(timeout=45.0) as http_client:
-            fetched = await fetch_chemistry_observations(http_client, notation)
+        # Nightly job hasn't reached this site yet - try a live fetch, don't
+        # persist. The EA Water Quality API is often very slow (tens of
+        # seconds, occasionally over a minute) for sites with a lot of
+        # sampling history, regardless of page size or date filtering, so
+        # bound the wait and fail soft rather than hanging the request past
+        # Vercel's function timeout.
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as http_client:
+                fetched = await fetch_chemistry_observations(http_client, notation)
+        except httpx.HTTPError:
+            fetched = []
+            sync_pending = True
         observations = [{**o, "is_outlier": False} for o in fetched]
 
         seen = {}
@@ -233,7 +251,13 @@ async def get_quality_timeseries(notation: str):
                 ),
             })
 
-    return {"notation": notation, "observations": observations, "determinands": determinands, "stats": site_stats}
+    return {
+        "notation": notation,
+        "observations": observations,
+        "determinands": determinands,
+        "stats": site_stats,
+        "sync_pending": sync_pending,
+    }
 
 
 @app.get("/api/search/postcode")

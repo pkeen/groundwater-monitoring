@@ -83,6 +83,7 @@ function StatsSummary({ stat, unit }: { stat: SiteStats; unit?: string | null })
 export default function SitePanel({ site, onClose }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [syncPending, setSyncPending] = useState(false);
 
   const [levelReadings, setLevelReadings] = useState<LevelReading[]>([]);
   const [levelStats, setLevelStats] = useState<SiteStats | null>(null);
@@ -95,25 +96,28 @@ export default function SitePanel({ site, onClose }: Props) {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setSyncPending(false);
     setSelectedDeterminand(null);
 
     if (site.type === "level") {
       fetchLevelTimeseries(site.id)
-        .then(({ readings, stats }) => {
+        .then(({ readings, stats, sync_pending }) => {
           if (cancelled) return;
           setLevelReadings(readings);
           setLevelStats(stats);
+          setSyncPending(!!sync_pending);
         })
         .catch(() => !cancelled && setError("Could not load level readings."))
         .finally(() => !cancelled && setLoading(false));
     } else {
       fetchQualityTimeseries(site.id)
-        .then(({ observations, determinands, stats }) => {
+        .then(({ observations, determinands, stats, sync_pending }) => {
           if (cancelled) return;
           setObservations(observations);
           setDeterminands(determinands);
           setQualityStats(stats);
           setSelectedDeterminand(determinands[0]?.determinand_code ?? null);
+          setSyncPending(!!sync_pending);
         })
         .catch(() => !cancelled && setError("Could not load chemistry observations."))
         .finally(() => !cancelled && setLoading(false));
@@ -167,6 +171,12 @@ export default function SitePanel({ site, onClose }: Props) {
 
       {loading && <p className="text-sm text-gray-500">Loading time series...</p>}
       {error && <p className="text-sm text-red-600">{error}</p>}
+      {!loading && !error && syncPending && (
+        <p className="text-sm text-amber-600">
+          This site hasn&apos;t been synced yet and the live data source is responding too
+          slowly to load right now. It will be available after the next nightly refresh.
+        </p>
+      )}
 
       {!loading && !error && site.type === "quality" && (
         <div>
@@ -192,7 +202,7 @@ export default function SitePanel({ site, onClose }: Props) {
         <StatsSummary stat={currentQualityStat} unit={currentUnit} />
       )}
 
-      {!loading && !error && chartData.length === 0 && (
+      {!loading && !error && !syncPending && chartData.length === 0 && (
         <p className="text-sm text-gray-500">No numeric readings available to plot.</p>
       )}
 

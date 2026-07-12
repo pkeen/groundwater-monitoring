@@ -73,7 +73,7 @@ export async function fetchSites(q?: string): Promise<SiteSummary[]> {
 
 export async function fetchLevelTimeseries(
   notation: string
-): Promise<{ readings: LevelReading[]; stats: SiteStats | null }> {
+): Promise<{ readings: LevelReading[]; stats: SiteStats | null; sync_pending?: boolean }> {
   const res = await fetch(`${API_BASE}/api/sites/level/${encodeURIComponent(notation)}/timeseries`);
   if (!res.ok) throw new Error("Failed to load level readings");
   return res.json();
@@ -81,7 +81,12 @@ export async function fetchLevelTimeseries(
 
 export async function fetchQualityTimeseries(
   notation: string
-): Promise<{ observations: ChemistryObservation[]; determinands: Determinand[]; stats: SiteStats[] }> {
+): Promise<{
+  observations: ChemistryObservation[];
+  determinands: Determinand[];
+  stats: SiteStats[];
+  sync_pending?: boolean;
+}> {
   const res = await fetch(`${API_BASE}/api/sites/quality/${encodeURIComponent(notation)}/timeseries`);
   if (!res.ok) throw new Error("Failed to load chemistry observations");
   return res.json();
