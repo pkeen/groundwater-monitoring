@@ -61,8 +61,8 @@ def sen_slope_per_year(dates: list[str], values: list[float]) -> float | None:
 
 def trend(dates: list[str], values: list[float]) -> dict:
     """Mann-Kendall trend test (direction + significance) plus a Sen's-slope
-    based rate of change per year. This is the standard technique UK
-    hydrogeologists (EA/CEH) use for borehole trend detection."""
+    based rate of change per year. This is the standard technique EA/CEH
+    hydrogeologists use for borehole trend detection."""
     if len(values) < MIN_TREND_POINTS:
         return {"trend_direction": "insufficient_data", "trend_slope_per_year": None, "trend_p_value": None}
 

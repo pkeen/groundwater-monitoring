@@ -79,7 +79,7 @@ export default function Home() {
     <div className="flex h-screen w-screen flex-col">
       <header className="z-10 flex flex-wrap items-center justify-between gap-3 border-b border-gray-200 bg-white px-4 py-3 shadow-sm">
         <div>
-          <h1 className="text-lg font-semibold text-gray-900">UK Groundwater Monitoring</h1>
+          <h1 className="text-lg font-semibold text-gray-900">England Groundwater Monitoring</h1>
           <p className="text-xs text-gray-500">
             {counts.level} level stations &middot; {counts.quality} quality sampling points
             {visibleSites.length !== allSites.length && (
