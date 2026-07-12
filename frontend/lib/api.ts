@@ -16,6 +16,7 @@ export interface LevelReading {
   date_time: string;
   value: number | null;
   quality: string | null;
+  is_outlier: boolean | number;
 }
 
 export interface Determinand {
@@ -32,6 +33,33 @@ export interface ChemistryObservation {
   result_value: number | null;
   simple_result: string | null;
   unit_label: string | null;
+  is_outlier: boolean | number;
+}
+
+export interface SiteStats {
+  site_notation?: string;
+  determinand_code?: string;
+  determinand_label?: string;
+  unit_label?: string | null;
+  count: number;
+  censored_count?: number;
+  min_value: number | null;
+  max_value: number | null;
+  mean_value: number | null;
+  median_value: number | null;
+  stddev_value: number | null;
+  latest_value: number | null;
+  latest_date: string | null;
+  first_date: string | null;
+  trend_direction: string | null;
+  trend_slope_per_year: number | null;
+  trend_p_value: number | null;
+  outlier_count?: number;
+  is_sparse?: boolean;
+  is_stale?: boolean;
+  censored_fraction?: number;
+  days_since_latest?: number | null;
+  label: string;
 }
 
 export async function fetchSites(q?: string): Promise<SiteSummary[]> {
@@ -43,16 +71,17 @@ export async function fetchSites(q?: string): Promise<SiteSummary[]> {
   return data.sites;
 }
 
-export async function fetchLevelTimeseries(notation: string): Promise<LevelReading[]> {
+export async function fetchLevelTimeseries(
+  notation: string
+): Promise<{ readings: LevelReading[]; stats: SiteStats | null }> {
   const res = await fetch(`${API_BASE}/api/sites/level/${encodeURIComponent(notation)}/timeseries`);
   if (!res.ok) throw new Error("Failed to load level readings");
-  const data = await res.json();
-  return data.readings;
+  return res.json();
 }
 
 export async function fetchQualityTimeseries(
   notation: string
-): Promise<{ observations: ChemistryObservation[]; determinands: Determinand[] }> {
+): Promise<{ observations: ChemistryObservation[]; determinands: Determinand[]; stats: SiteStats[] }> {
   const res = await fetch(`${API_BASE}/api/sites/quality/${encodeURIComponent(notation)}/timeseries`);
   if (!res.ok) throw new Error("Failed to load chemistry observations");
   return res.json();

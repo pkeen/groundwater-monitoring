@@ -1,5 +1,6 @@
-"""On-demand fetchers for EA time-series data, called lazily per site and
-cached in SQLite so repeat requests don't hit the upstream API again."""
+"""Async fetchers for EA time-series data. Used both by the on-demand
+fallback path in main.py (single site, one-off) and by the nightly
+refresh job (thousands of sites, run with bounded concurrency)."""
 from datetime import datetime, timezone
 
 import httpx
@@ -24,8 +25,10 @@ def pick_level_measure(measures: list[dict]) -> dict | None:
     return measures[0]
 
 
-def fetch_level_readings(client: httpx.Client, station_notation: str) -> list[dict]:
-    resp = client.get(
+async def fetch_level_readings(
+    client: httpx.AsyncClient, station_notation: str, since: str | None = None
+) -> list[dict]:
+    resp = await client.get(
         f"{HYDROLOGY_BASE}/id/stations/{station_notation}/measures",
         headers={"Accept": "application/json"},
     )
@@ -36,13 +39,17 @@ def fetch_level_readings(client: httpx.Client, station_notation: str) -> list[di
         return []
 
     measure_id = measure["@id"].rsplit("/", 1)[-1]
+    params: dict = {}
+    if since:
+        params["mineq-date"] = since[:10]
+
     readings: list[dict] = []
     offset = 0
     limit = 2000
     while True:
-        r = client.get(
+        r = await client.get(
             f"{HYDROLOGY_BASE}/id/measures/{measure_id}/readings",
-            params={"_limit": limit, "_offset": offset},
+            params={**params, "_limit": limit, "_offset": offset},
             headers={"Accept": "application/json"},
         )
         r.raise_for_status()
@@ -65,14 +72,20 @@ def fetch_level_readings(client: httpx.Client, station_notation: str) -> list[di
     return readings
 
 
-def fetch_chemistry_observations(client: httpx.Client, site_notation: str) -> list[dict]:
+async def fetch_chemistry_observations(
+    client: httpx.AsyncClient, site_notation: str, since: str | None = None
+) -> list[dict]:
+    params: dict = {}
+    if since:
+        params["dateFrom"] = since[:10]
+
     observations: list[dict] = []
     skip = 0
     limit = 250
     while True:
-        r = client.get(
+        r = await client.get(
             f"{WQ_BASE}/sampling-point/{site_notation}/observation",
-            params={"limit": limit, "skip": skip},
+            params={**params, "limit": limit, "skip": skip},
             headers=WQ_HEADERS,
         )
         r.raise_for_status()

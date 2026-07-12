@@ -1,25 +1,53 @@
+import ast
+import json
 import math
+import os
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.db import get_connection, init_db
-from app.ea_client import fetch_chemistry_observations, fetch_level_readings, now_iso
+from app import stats
+from app.db import get_client, init_db
+from app.ea_client import fetch_chemistry_observations, fetch_level_readings
 
-app = FastAPI(title="Groundwater Monitoring API")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(title="Groundwater Monitoring API", lifespan=lifespan)
+
+allowed_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
+def _flatten_stats_row(row: dict) -> dict:
+    """Cached stats rows store their data-quality flags as a JSON blob
+    (`data_quality_flags`) alongside a plain `data_quality_label` column; the
+    live-fallback path builds the same flags inline instead. Flatten the
+    cached shape to match so the frontend sees one consistent stats shape
+    regardless of which path served it."""
+    flags_json = row.pop("data_quality_flags", None)
+    label = row.pop("data_quality_label", None)
+    flags = {}
+    if flags_json:
+        try:
+            flags = json.loads(flags_json)
+        except json.JSONDecodeError:
+            # Rows written before refresh.py switched from str(dict) to
+            # json.dumps(dict) are a Python repr, not JSON - still readable.
+            flags = ast.literal_eval(flags_json)
+    flags.setdefault("label", label)
+    return {**row, **flags}
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
@@ -32,9 +60,9 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
 
 
 @app.get("/api/sites")
-def list_sites(bbox: str | None = None, q: str | None = None, limit: int = 5000):
+async def list_sites(bbox: str | None = None, q: str | None = None, limit: int = 5000):
     """Sites for the map. bbox format: minLon,minLat,maxLon,maxLat"""
-    conn = get_connection()
+    db = get_client()
     where = ["lat IS NOT NULL", "lon IS NOT NULL"]
     params: list = []
 
@@ -52,174 +80,179 @@ def list_sites(bbox: str | None = None, q: str | None = None, limit: int = 5000)
 
     where_clause = "WHERE " + " AND ".join(where)
 
-    level_rows = conn.execute(
+    level_rows = await db.execute(
         f"SELECT notation, label, lat, lon, status FROM level_stations {where_clause} LIMIT ?",
         [*params, limit],
-    ).fetchall()
-
-    quality_rows = conn.execute(
+    )
+    quality_rows = await db.execute(
         f"SELECT notation, label, lat, lon, status_label FROM quality_sites {where_clause} LIMIT ?",
         [*params, limit],
-    ).fetchall()
-    conn.close()
+    )
+    await db.close()
 
     sites = [
-        {
-            "id": r["notation"],
-            "type": "level",
-            "label": r["label"],
-            "lat": r["lat"],
-            "lon": r["lon"],
-            "status": r["status"],
-        }
+        {"id": r["notation"], "type": "level", "label": r["label"], "lat": r["lat"], "lon": r["lon"], "status": r["status"]}
         for r in level_rows
     ] + [
-        {
-            "id": r["notation"],
-            "type": "quality",
-            "label": r["label"],
-            "lat": r["lat"],
-            "lon": r["lon"],
-            "status": r["status_label"],
-        }
+        {"id": r["notation"], "type": "quality", "label": r["label"], "lat": r["lat"], "lon": r["lon"], "status": r["status_label"]}
         for r in quality_rows
     ]
     return {"count": len(sites), "sites": sites}
 
 
 @app.get("/api/sites/level/{notation}")
-def get_level_station(notation: str):
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM level_stations WHERE notation = ?", (notation,)).fetchone()
-    conn.close()
-    if not row:
+async def get_level_station(notation: str):
+    db = get_client()
+    rs = await db.execute("SELECT * FROM level_stations WHERE notation = ?", [notation])
+    await db.close()
+    if not len(rs):
         raise HTTPException(404, "Station not found")
-    return dict(row)
+    return rs[0].asdict()
 
 
 @app.get("/api/sites/quality/{notation}")
-def get_quality_site(notation: str):
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM quality_sites WHERE notation = ?", (notation,)).fetchone()
-    conn.close()
-    if not row:
+async def get_quality_site(notation: str):
+    db = get_client()
+    rs = await db.execute("SELECT * FROM quality_sites WHERE notation = ?", [notation])
+    await db.close()
+    if not len(rs):
         raise HTTPException(404, "Site not found")
-    return dict(row)
+    return rs[0].asdict()
 
 
 @app.get("/api/sites/level/{notation}/timeseries")
-def get_level_timeseries(notation: str):
-    conn = get_connection()
-    station = conn.execute("SELECT notation FROM level_stations WHERE notation = ?", (notation,)).fetchone()
-    if not station:
-        conn.close()
+async def get_level_timeseries(notation: str):
+    db = get_client()
+    station = await db.execute("SELECT notation FROM level_stations WHERE notation = ?", [notation])
+    if not len(station):
+        await db.close()
         raise HTTPException(404, "Station not found")
 
-    cached = conn.execute(
-        "SELECT 1 FROM chemistry_fetch_log WHERE site_notation = ?", (f"level:{notation}",)
-    ).fetchone()
+    readings_rs = await db.execute(
+        "SELECT date_time, value, quality, is_outlier FROM level_readings WHERE station_notation = ? ORDER BY date_time",
+        [notation],
+    )
+    readings = [r.asdict() for r in readings_rs]
+    stats_rs = await db.execute("SELECT * FROM level_station_stats WHERE station_notation = ?", [notation])
+    site_stats = _flatten_stats_row(stats_rs[0].asdict()) if len(stats_rs) else None
+    await db.close()
 
-    if not cached:
-        with httpx.Client(timeout=30.0) as client:
-            readings = fetch_level_readings(client, notation)
-        rows = [(notation, r["date_time"], r["value"], r["quality"]) for r in readings]
-        conn.executemany(
-            "INSERT OR REPLACE INTO level_readings (station_notation, date_time, value, quality) VALUES (?,?,?,?)",
-            rows,
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO chemistry_fetch_log (site_notation, fetched_at) VALUES (?, ?)",
-            (f"level:{notation}", now_iso()),
-        )
-        conn.commit()
+    if not readings:
+        # Nightly job hasn't reached this site yet - fetch live, don't persist.
+        async with httpx.AsyncClient(timeout=45.0) as http_client:
+            fetched = await fetch_level_readings(http_client, notation)
+        readings = [{**r, "is_outlier": False} for r in fetched]
+        values = [r["value"] for r in readings if r["value"] is not None]
+        dates = [r["date_time"] for r in readings if r["value"] is not None]
+        if values:
+            summary = stats.summarize(values)
+            trend = stats.trend(dates, values)
+            site_stats = {
+                **summary,
+                **trend,
+                "latest_value": values[-1],
+                "latest_date": dates[-1],
+                "first_date": dates[0],
+                **stats.data_quality_flags(
+                    count=len(values), censored_count=0, latest_date=dates[-1],
+                    stale_days_threshold=stats.STALE_DAYS_LEVEL,
+                ),
+            }
 
-    readings = conn.execute(
-        "SELECT date_time, value, quality FROM level_readings WHERE station_notation = ? ORDER BY date_time",
-        (notation,),
-    ).fetchall()
-    conn.close()
-    return {"notation": notation, "readings": [dict(r) for r in readings]}
+    return {"notation": notation, "readings": readings, "stats": site_stats}
 
 
 @app.get("/api/sites/quality/{notation}/timeseries")
-def get_quality_timeseries(notation: str):
-    conn = get_connection()
-    site = conn.execute("SELECT notation FROM quality_sites WHERE notation = ?", (notation,)).fetchone()
-    if not site:
-        conn.close()
+async def get_quality_timeseries(notation: str):
+    db = get_client()
+    site = await db.execute("SELECT notation FROM quality_sites WHERE notation = ?", [notation])
+    if not len(site):
+        await db.close()
         raise HTTPException(404, "Site not found")
 
-    cached = conn.execute(
-        "SELECT 1 FROM chemistry_fetch_log WHERE site_notation = ?", (notation,)
-    ).fetchone()
-
-    if not cached:
-        with httpx.Client(timeout=30.0) as client:
-            observations = fetch_chemistry_observations(client, notation)
-        rows = [
-            (
-                notation,
-                o["observation_id"],
-                o["sample_date"],
-                o["determinand_code"],
-                o["determinand_label"],
-                o["result_value"],
-                o["simple_result"],
-                o["unit_label"],
-            )
-            for o in observations
-        ]
-        conn.executemany(
-            """INSERT OR REPLACE INTO chemistry_observations
-               (site_notation, observation_id, sample_date, determinand_code, determinand_label,
-                result_value, simple_result, unit_label)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            rows,
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO chemistry_fetch_log (site_notation, fetched_at) VALUES (?, ?)",
-            (notation, now_iso()),
-        )
-        conn.commit()
-
-    observations = conn.execute(
+    obs_rs = await db.execute(
         """SELECT observation_id, sample_date, determinand_code, determinand_label,
-                  result_value, simple_result, unit_label
+                  result_value, simple_result, unit_label, is_outlier
            FROM chemistry_observations WHERE site_notation = ? ORDER BY sample_date""",
-        (notation,),
-    ).fetchall()
+        [notation],
+    )
+    observations = [r.asdict() for r in obs_rs]
 
-    determinands = conn.execute(
+    determinands_rs = await db.execute(
         """SELECT DISTINCT determinand_code, determinand_label, unit_label
            FROM chemistry_observations WHERE site_notation = ? ORDER BY determinand_label""",
-        (notation,),
-    ).fetchall()
-    conn.close()
+        [notation],
+    )
+    determinands = [r.asdict() for r in determinands_rs]
 
-    return {
-        "notation": notation,
-        "observations": [dict(r) for r in observations],
-        "determinands": [dict(r) for r in determinands],
-    }
+    stats_rs = await db.execute("SELECT * FROM quality_site_stats WHERE site_notation = ?", [notation])
+    site_stats = [_flatten_stats_row(r.asdict()) for r in stats_rs]
+    await db.close()
+
+    if not observations:
+        # Nightly job hasn't reached this site yet - fetch live, don't persist.
+        async with httpx.AsyncClient(timeout=45.0) as http_client:
+            fetched = await fetch_chemistry_observations(http_client, notation)
+        observations = [{**o, "is_outlier": False} for o in fetched]
+
+        seen = {}
+        for o in observations:
+            seen.setdefault(o["determinand_code"], {"label": o["determinand_label"], "unit": o["unit_label"]})
+        determinands = [
+            {"determinand_code": code, "determinand_label": v["label"], "unit_label": v["unit"]}
+            for code, v in seen.items()
+        ]
+
+        site_stats = []
+        by_determinand: dict[str, list[dict]] = {}
+        for o in observations:
+            by_determinand.setdefault(o["determinand_code"], []).append(o)
+        for code, obs in by_determinand.items():
+            numeric = [o for o in obs if o["result_value"] is not None]
+            values = [o["result_value"] for o in numeric]
+            dates = [o["sample_date"] for o in numeric]
+            censored_count = sum(1 for o in obs if o["result_value"] is None and o["simple_result"])
+            summary = stats.summarize(values)
+            trend = stats.trend(dates, values) if values else {
+                "trend_direction": "insufficient_data", "trend_slope_per_year": None, "trend_p_value": None,
+            }
+            site_stats.append({
+                "site_notation": notation,
+                "determinand_code": code,
+                "determinand_label": obs[0]["determinand_label"],
+                "unit_label": obs[0]["unit_label"],
+                **summary,
+                **trend,
+                "censored_count": censored_count,
+                "latest_value": values[-1] if values else None,
+                "latest_date": obs[-1]["sample_date"],
+                "first_date": obs[0]["sample_date"],
+                **stats.data_quality_flags(
+                    count=len(obs), censored_count=censored_count, latest_date=obs[-1]["sample_date"],
+                    stale_days_threshold=stats.STALE_DAYS_QUALITY,
+                ),
+            })
+
+    return {"notation": notation, "observations": observations, "determinands": determinands, "stats": site_stats}
 
 
 @app.get("/api/search/postcode")
-def search_postcode(postcode: str, radius_km: float = 15.0, limit: int = 50):
-    with httpx.Client(timeout=10.0) as client:
-        resp = client.get(f"https://api.postcodes.io/postcodes/{postcode}")
+async def search_postcode(postcode: str, radius_km: float = 15.0, limit: int = 50):
+    async with httpx.AsyncClient(timeout=10.0) as http_client:
+        resp = await http_client.get(f"https://api.postcodes.io/postcodes/{postcode}")
     if resp.status_code != 200:
         raise HTTPException(404, "Postcode not found")
     result = resp.json()["result"]
     lat, lon = result["latitude"], result["longitude"]
 
-    conn = get_connection()
-    level_rows = conn.execute(
+    db = get_client()
+    level_rows = await db.execute(
         "SELECT notation, label, lat, lon FROM level_stations WHERE lat IS NOT NULL AND lon IS NOT NULL"
-    ).fetchall()
-    quality_rows = conn.execute(
+    )
+    quality_rows = await db.execute(
         "SELECT notation, label, lat, lon FROM quality_sites WHERE lat IS NOT NULL AND lon IS NOT NULL"
-    ).fetchall()
-    conn.close()
+    )
+    await db.close()
 
     results = []
     for r in level_rows:
@@ -232,9 +265,4 @@ def search_postcode(postcode: str, radius_km: float = 15.0, limit: int = 50):
             results.append({"id": r["notation"], "type": "quality", "label": r["label"], "lat": r["lat"], "lon": r["lon"], "distance_km": round(d, 2)})
 
     results.sort(key=lambda x: x["distance_km"])
-    return {
-        "postcode": result["postcode"],
-        "lat": lat,
-        "lon": lon,
-        "sites": results[:limit],
-    }
+    return {"postcode": result["postcode"], "lat": lat, "lon": lon, "sites": results[:limit]}
