@@ -1,4 +1,4 @@
-# England Groundwater Monitoring Dashboard
+# Groundwater Monitoring in England
 
 **Live app:** [groundwater-monitoring-sigma.vercel.app](https://groundwater-monitoring-sigma.vercel.app)
 **API:** [groundwater-monitoring-api.vercel.app](https://groundwater-monitoring-api.vercel.app)

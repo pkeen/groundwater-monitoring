@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "England Groundwater Monitoring",
+  title: "Groundwater Monitoring in England",
   description: "Groundwater level and quality monitoring dashboard using Environment Agency data",
 };
 
