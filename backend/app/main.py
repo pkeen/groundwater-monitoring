@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import stats
 from app.db import get_client, init_db
-from app.ea_client import fetch_chemistry_observations, fetch_level_readings
+from app.ea_client import fetch_chemistry_observations, fetch_level_readings, history_cutoff_date
 
 
 @asynccontextmanager
@@ -145,7 +145,7 @@ async def get_level_timeseries(notation: str):
         # than hanging the request past Vercel's function timeout.
         try:
             async with httpx.AsyncClient(timeout=20.0) as http_client:
-                fetched = await fetch_level_readings(http_client, notation)
+                fetched = await fetch_level_readings(http_client, notation, since=history_cutoff_date())
         except httpx.HTTPError:
             fetched = []
             sync_pending = True
@@ -207,7 +207,7 @@ async def get_quality_timeseries(notation: str):
         # Vercel's function timeout.
         try:
             async with httpx.AsyncClient(timeout=20.0) as http_client:
-                fetched = await fetch_chemistry_observations(http_client, notation)
+                fetched = await fetch_chemistry_observations(http_client, notation, since=history_cutoff_date())
         except httpx.HTTPError:
             fetched = []
             sync_pending = True

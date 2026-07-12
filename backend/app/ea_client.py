@@ -1,7 +1,7 @@
 """Async fetchers for EA time-series data. Used both by the on-demand
 fallback path in main.py (single site, one-off) and by the nightly
 refresh job (thousands of sites, run with bounded concurrency)."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -9,6 +9,18 @@ HYDROLOGY_BASE = "https://environment.data.gov.uk/hydrology"
 WQ_BASE = "https://environment.data.gov.uk/water-quality"
 
 WQ_HEADERS = {"Accept": "application/ld+json"}
+
+# A first-time sync fetches this many years of back-history per site, not a
+# site's full record. Level stations especially can have decades of readings
+# at sub-daily resolution, and backfilling every site's complete history
+# blows through Turso's row-write quota (see the incident where a full
+# backfill wrote 4.4M rows for ~570 sites in under half an hour). 5 years is
+# still plenty for the trend/outlier stats to be meaningful.
+HISTORY_CAP_YEARS = 5
+
+
+def history_cutoff_date() -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=365 * HISTORY_CAP_YEARS)).date().isoformat()
 
 
 def pick_level_measure(measures: list[dict]) -> dict | None:

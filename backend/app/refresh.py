@@ -4,10 +4,17 @@ hand locally: `python -m app.refresh`).
 Three phases:
   1. Re-sync site registries (cheap, catches new/closed sites).
   2. Incrementally fetch new readings/observations per site, since whatever
-     `site_sync_state.latest_data_date` says (or full history on first run),
-     with bounded concurrency so a full ~9,200-site backfill is tractable.
-  3. Recompute summary stats/trend/outlier flags for every site that has any
-     data, sequentially (pure local computation, no network calls).
+     `site_sync_state.latest_data_date` says (or the last `HISTORY_CAP_YEARS`
+     on first run), with bounded concurrency so a full ~9,200-site backfill
+     is tractable.
+  3. Recompute summary stats/trend/outlier flags, but only for sites that
+     actually received new readings/observations this run - a site with no
+     new data has an unchanged series, so its cached stats are still
+     correct. This matters because Turso bills UPDATEs by rows affected:
+     recomputing a site rewrites `is_outlier` across its *entire* reading
+     history, so doing this unconditionally for every ever-synced site,
+     every night, silently burns through the row-write quota regardless of
+     how much new data actually arrived.
 """
 import asyncio
 import json
@@ -21,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import stats
 from app.db import get_client, init_db
-from app.ea_client import fetch_chemistry_observations, fetch_level_readings, now_iso
+from app.ea_client import fetch_chemistry_observations, fetch_level_readings, history_cutoff_date, now_iso
 from app.ingest import ingest_level_stations, ingest_quality_sites
 
 CONCURRENCY = 10
@@ -51,7 +58,7 @@ async def sync_level_station(sem: asyncio.Semaphore, http_client: httpx.AsyncCli
         db = get_client()
         try:
             state = await get_sync_state(db, notation, "level")
-            since = state["latest_data_date"] if state else None
+            since = state["latest_data_date"] if state else history_cutoff_date()
             readings = await fetch_level_readings(http_client, notation, since=since)
             if readings:
                 statements = [
@@ -79,7 +86,7 @@ async def sync_quality_site(sem: asyncio.Semaphore, http_client: httpx.AsyncClie
         db = get_client()
         try:
             state = await get_sync_state(db, notation, "quality")
-            since = state["latest_data_date"] if state else None
+            since = state["latest_data_date"] if state else history_cutoff_date()
             observations = await fetch_chemistry_observations(http_client, notation, since=since)
             if observations:
                 statements = [
@@ -114,25 +121,42 @@ async def sync_quality_site(sem: asyncio.Semaphore, http_client: httpx.AsyncClie
             await db.close()
 
 
-async def sync_all_readings() -> None:
+async def _sync_level_task(sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str) -> tuple[str, str, int]:
+    count = await sync_level_station(sem, http_client, notation)
+    return "level", notation, count
+
+
+async def _sync_quality_task(sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str) -> tuple[str, str, int]:
+    count = await sync_quality_site(sem, http_client, notation)
+    return "quality", notation, count
+
+
+async def sync_all_readings() -> tuple[set[str], set[str]]:
     db = get_client()
     level_notations = [r["notation"] for r in await db.execute("SELECT notation FROM level_stations")]
     quality_notations = [r["notation"] for r in await db.execute("SELECT notation FROM quality_sites")]
     await db.close()
 
     sem = asyncio.Semaphore(CONCURRENCY)
+    updated_level: set[str] = set()
+    updated_quality: set[str] = set()
     async with httpx.AsyncClient(timeout=60.0) as http_client:
-        tasks = [sync_level_station(sem, http_client, n) for n in level_notations]
-        tasks += [sync_quality_site(sem, http_client, n) for n in quality_notations]
+        tasks = [_sync_level_task(sem, http_client, n) for n in level_notations]
+        tasks += [_sync_quality_task(sem, http_client, n) for n in quality_notations]
 
         total = len(tasks)
         done = 0
         new_rows = 0
         for coro in asyncio.as_completed(tasks):
-            new_rows += await coro
+            site_type, notation, count = await coro
+            new_rows += count
+            if count > 0:
+                (updated_level if site_type == "level" else updated_quality).add(notation)
             done += 1
             if done % 200 == 0 or done == total:
                 print(f"  synced {done}/{total} sites ({new_rows} new rows so far)...")
+
+    return updated_level, updated_quality
 
 
 async def recompute_level_stats(db, notation: str) -> None:
@@ -260,15 +284,14 @@ async def recompute_quality_stats(db, notation: str) -> None:
     await db.batch(statements)
 
 
-async def recompute_all_stats() -> None:
+async def recompute_all_stats(updated_level: set[str], updated_quality: set[str]) -> None:
+    """Only recomputes sites that received new readings/observations this
+    run - see the module docstring for why recomputing untouched sites is
+    both wasted work and a quota hazard."""
     db = get_client()
     try:
-        level_notations = [r["notation"] for r in await db.execute(
-            "SELECT DISTINCT station_notation AS notation FROM level_readings"
-        )]
-        quality_notations = [r["notation"] for r in await db.execute(
-            "SELECT DISTINCT site_notation AS notation FROM chemistry_observations"
-        )]
+        level_notations = sorted(updated_level)
+        quality_notations = sorted(updated_quality)
 
         for i, notation in enumerate(level_notations):
             await recompute_level_stats(db, notation)
@@ -294,11 +317,11 @@ async def main() -> None:
     print(f"  {n_level} level stations, {n_quality} quality sites.\n")
 
     print("Phase 2: syncing readings/observations (incremental)...")
-    await sync_all_readings()
+    updated_level, updated_quality = await sync_all_readings()
     print()
 
-    print("Phase 3: recomputing stats/trend/outliers...")
-    await recompute_all_stats()
+    print("Phase 3: recomputing stats/trend/outliers for sites with new data...")
+    await recompute_all_stats(updated_level, updated_quality)
 
     elapsed = time.monotonic() - start
     print(f"\nRefresh complete in {elapsed / 60:.1f} minutes.")
