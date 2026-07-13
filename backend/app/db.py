@@ -140,11 +140,21 @@ def get_client() -> libsql_client.Client:
 
 
 async def init_db() -> None:
+    """Runs schema creation/migration statements. These are idempotent
+    no-ops once the schema exists, but they're still writes - if the
+    database is out of write quota (or otherwise unreachable for writes),
+    they'll fail, and libsql_client raises an opaque KeyError rather than a
+    typed exception in that case. Since the schema is already in place on
+    every deploy after the first, failing to (re)confirm that on a cold
+    start shouldn't take the whole app down - log and continue so reads
+    still work."""
     client = get_client()
     try:
         for stmt in SCHEMA_STATEMENTS:
             await client.execute(stmt)
         await _migrate_columns(client)
+    except Exception as exc:
+        print(f"init_db: schema check/migration failed, continuing anyway: {exc}")
     finally:
         await client.close()
 
