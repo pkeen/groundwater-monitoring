@@ -3,6 +3,12 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+  /* Every component in this app hardcodes light-mode Tailwind classes
+     (bg-white, text-gray-900, etc.) rather than reacting to color scheme, so
+     letting the browser auto-dark-theme just body text/backgrounds (or native
+     form controls) breaks contrast against those hardcoded surfaces. Pin
+     light unconditionally until dark mode is actually implemented throughout. */
+  color-scheme: light;
 }
 
 @theme inline {
@@ -10,13 +16,6 @@
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
 }
 
 body {
