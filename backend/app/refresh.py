@@ -31,7 +31,44 @@ from app.db import get_client, init_db
 from app.ea_client import fetch_chemistry_observations, fetch_level_readings, history_cutoff_date, now_iso
 from app.ingest import ingest_level_stations, ingest_quality_sites
 
-CONCURRENCY = 10
+CONCURRENCY = 5
+
+# After this many consecutive 403s (the EA API blocking us mid-run - see the
+# 2026-07-19 incident where a sustained run got flagged and every subsequent
+# request failed for the rest of the run), stop hammering their server and
+# back off instead of burning through the remaining site queue at full speed
+# against a wall.
+CONSECUTIVE_403_THRESHOLD = 15
+BACKOFF_SECONDS = 120
+
+
+class RateLimiter:
+    """Shared circuit breaker across all concurrent sync tasks: pauses new
+    requests for a cooldown period once repeated 403s suggest we've been
+    rate-limited/blocked, instead of continuing to fire doomed requests."""
+
+    def __init__(self) -> None:
+        self.consecutive_403s = 0
+        self.paused_until = 0.0
+
+    def record_success(self) -> None:
+        self.consecutive_403s = 0
+
+    def record_403(self) -> None:
+        self.consecutive_403s += 1
+        if self.consecutive_403s >= CONSECUTIVE_403_THRESHOLD:
+            self.paused_until = time.monotonic() + BACKOFF_SECONDS
+            print(f"  !! {self.consecutive_403s} consecutive 403s - pausing {BACKOFF_SECONDS}s before continuing")
+            self.consecutive_403s = 0
+
+    async def wait_if_paused(self) -> None:
+        remaining = self.paused_until - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+
+def _is_403(exc: Exception) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 403
 
 
 async def get_sync_state(db, notation: str, site_type: str) -> dict | None:
@@ -53,13 +90,17 @@ async def set_sync_state(db, notation: str, site_type: str, latest_data_date: st
     )
 
 
-async def sync_level_station(sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str) -> int:
+async def sync_level_station(
+    sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str, limiter: RateLimiter
+) -> int:
     async with sem:
+        await limiter.wait_if_paused()
         db = get_client()
         try:
             state = await get_sync_state(db, notation, "level")
             since = state["latest_data_date"] if state else history_cutoff_date()
             readings = await fetch_level_readings(http_client, notation, since=since)
+            limiter.record_success()
             if readings:
                 statements = [
                     (
@@ -75,19 +116,25 @@ async def sync_level_station(sem: asyncio.Semaphore, http_client: httpx.AsyncCli
                 await set_sync_state(db, notation, "level", None)
             return len(readings)
         except Exception as exc:
+            if _is_403(exc):
+                limiter.record_403()
             print(f"  [level:{notation}] error: {exc}")
             return 0
         finally:
             await db.close()
 
 
-async def sync_quality_site(sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str) -> int:
+async def sync_quality_site(
+    sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str, limiter: RateLimiter
+) -> int:
     async with sem:
+        await limiter.wait_if_paused()
         db = get_client()
         try:
             state = await get_sync_state(db, notation, "quality")
             since = state["latest_data_date"] if state else history_cutoff_date()
             observations = await fetch_chemistry_observations(http_client, notation, since=since)
+            limiter.record_success()
             if observations:
                 statements = [
                     (
@@ -115,19 +162,25 @@ async def sync_quality_site(sem: asyncio.Semaphore, http_client: httpx.AsyncClie
                 await set_sync_state(db, notation, "quality", None)
             return len(observations)
         except Exception as exc:
+            if _is_403(exc):
+                limiter.record_403()
             print(f"  [quality:{notation}] error: {exc}")
             return 0
         finally:
             await db.close()
 
 
-async def _sync_level_task(sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str) -> tuple[str, str, int]:
-    count = await sync_level_station(sem, http_client, notation)
+async def _sync_level_task(
+    sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str, limiter: RateLimiter
+) -> tuple[str, str, int]:
+    count = await sync_level_station(sem, http_client, notation, limiter)
     return "level", notation, count
 
 
-async def _sync_quality_task(sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str) -> tuple[str, str, int]:
-    count = await sync_quality_site(sem, http_client, notation)
+async def _sync_quality_task(
+    sem: asyncio.Semaphore, http_client: httpx.AsyncClient, notation: str, limiter: RateLimiter
+) -> tuple[str, str, int]:
+    count = await sync_quality_site(sem, http_client, notation, limiter)
     return "quality", notation, count
 
 
@@ -138,11 +191,12 @@ async def sync_all_readings() -> tuple[set[str], set[str]]:
     await db.close()
 
     sem = asyncio.Semaphore(CONCURRENCY)
+    limiter = RateLimiter()
     updated_level: set[str] = set()
     updated_quality: set[str] = set()
     async with httpx.AsyncClient(timeout=60.0) as http_client:
-        tasks = [_sync_level_task(sem, http_client, n) for n in level_notations]
-        tasks += [_sync_quality_task(sem, http_client, n) for n in quality_notations]
+        tasks = [_sync_level_task(sem, http_client, n, limiter) for n in level_notations]
+        tasks += [_sync_quality_task(sem, http_client, n, limiter) for n in quality_notations]
 
         total = len(tasks)
         done = 0
