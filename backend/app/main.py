@@ -170,6 +170,46 @@ async def get_level_timeseries(notation: str):
     return {"notation": notation, "readings": readings, "stats": site_stats, "sync_pending": sync_pending}
 
 
+def _compute_live_quality_stats(notation: str, observations: list[dict]) -> list[dict]:
+    """Same per-determinand summary/trend computation refresh.py's
+    recompute_quality_stats does, but in-memory rather than written to
+    quality_site_stats. Used whenever a site has observations but no cached
+    stats row yet - either because the nightly job hasn't reached its Phase 3
+    recompute for this site, or because the observations were just fetched
+    live below."""
+    by_determinand: dict[str, list[dict]] = {}
+    for o in observations:
+        by_determinand.setdefault(o["determinand_code"], []).append(o)
+
+    site_stats = []
+    for code, obs in by_determinand.items():
+        numeric = [o for o in obs if o["result_value"] is not None]
+        values = [o["result_value"] for o in numeric]
+        dates = [o["sample_date"] for o in numeric]
+        censored_count = sum(1 for o in obs if o["result_value"] is None and o["simple_result"])
+        summary = stats.summarize(values)
+        trend = stats.trend(dates, values) if values else {
+            "trend_direction": "insufficient_data", "trend_slope_per_year": None, "trend_p_value": None,
+        }
+        site_stats.append({
+            "site_notation": notation,
+            "determinand_code": code,
+            "determinand_label": obs[0]["determinand_label"],
+            "unit_label": obs[0]["unit_label"],
+            **summary,
+            **trend,
+            "censored_count": censored_count,
+            "latest_value": values[-1] if values else None,
+            "latest_date": obs[-1]["sample_date"],
+            "first_date": obs[0]["sample_date"],
+            **stats.data_quality_flags(
+                count=len(obs), censored_count=censored_count, latest_date=obs[-1]["sample_date"],
+                stale_days_threshold=stats.STALE_DAYS_QUALITY,
+            ),
+        })
+    return site_stats
+
+
 @app.get("/api/sites/quality/{notation}/timeseries")
 async def get_quality_timeseries(notation: str):
     db = get_client()
@@ -221,35 +261,12 @@ async def get_quality_timeseries(notation: str):
             for code, v in seen.items()
         ]
 
-        site_stats = []
-        by_determinand: dict[str, list[dict]] = {}
-        for o in observations:
-            by_determinand.setdefault(o["determinand_code"], []).append(o)
-        for code, obs in by_determinand.items():
-            numeric = [o for o in obs if o["result_value"] is not None]
-            values = [o["result_value"] for o in numeric]
-            dates = [o["sample_date"] for o in numeric]
-            censored_count = sum(1 for o in obs if o["result_value"] is None and o["simple_result"])
-            summary = stats.summarize(values)
-            trend = stats.trend(dates, values) if values else {
-                "trend_direction": "insufficient_data", "trend_slope_per_year": None, "trend_p_value": None,
-            }
-            site_stats.append({
-                "site_notation": notation,
-                "determinand_code": code,
-                "determinand_label": obs[0]["determinand_label"],
-                "unit_label": obs[0]["unit_label"],
-                **summary,
-                **trend,
-                "censored_count": censored_count,
-                "latest_value": values[-1] if values else None,
-                "latest_date": obs[-1]["sample_date"],
-                "first_date": obs[0]["sample_date"],
-                **stats.data_quality_flags(
-                    count=len(obs), censored_count=censored_count, latest_date=obs[-1]["sample_date"],
-                    stale_days_threshold=stats.STALE_DAYS_QUALITY,
-                ),
-            })
+    if not site_stats and observations:
+        # Either the fetch above just ran, or the nightly job's Phase 3
+        # recompute simply hasn't reached this site yet even though its
+        # observations are already synced - either way, compute the stats
+        # in-memory so the frontend still gets a trend rather than nothing.
+        site_stats = _compute_live_quality_stats(notation, observations)
 
     return {
         "notation": notation,
