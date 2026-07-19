@@ -176,3 +176,4 @@ if __name__ == "__main__":
 
     asyncio.run(init_db())
     print(f"Initialized database at {TURSO_DATABASE_URL or DB_PATH}")
+
