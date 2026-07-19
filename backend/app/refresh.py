@@ -161,7 +161,7 @@ async def sync_all_readings() -> tuple[set[str], set[str]]:
 
 async def recompute_level_stats(db, notation: str) -> None:
     rs = await db.execute(
-        "SELECT date_time, value FROM level_readings WHERE station_notation = ? AND value IS NOT NULL ORDER BY date_time",
+        "SELECT date_time, value, is_outlier FROM level_readings WHERE station_notation = ? AND value IS NOT NULL ORDER BY date_time",
         [notation],
     )
     rows = [r.asdict() for r in rs]
@@ -169,6 +169,7 @@ async def recompute_level_stats(db, notation: str) -> None:
         return
     dates = [r["date_time"] for r in rows]
     values = [r["value"] for r in rows]
+    stored_outlier = [bool(r["is_outlier"]) for r in rows]
 
     summary = stats.summarize(values)
     trend = stats.trend(dates, values)
@@ -202,19 +203,21 @@ async def recompute_level_stats(db, notation: str) -> None:
                 sum(outlier_flags), quality["label"], json.dumps(quality), now_iso(),
             ],
         ),
-        ("UPDATE level_readings SET is_outlier = 0 WHERE station_notation = ?", [notation]),
     ]
-    outlier_dates = [d for d, flagged in zip(dates, outlier_flags) if flagged]
     statements += [
-        ("UPDATE level_readings SET is_outlier = 1 WHERE station_notation = ? AND date_time = ?", [notation, d])
-        for d in outlier_dates
+        (
+            "UPDATE level_readings SET is_outlier = ? WHERE station_notation = ? AND date_time = ?",
+            [int(flagged), notation, d],
+        )
+        for d, flagged, was_flagged in zip(dates, outlier_flags, stored_outlier)
+        if flagged != was_flagged
     ]
     await db.batch(statements)
 
 
 async def recompute_quality_stats(db, notation: str) -> None:
     rs = await db.execute(
-        """SELECT observation_id, sample_date, determinand_code, determinand_label, result_value, simple_result, unit_label
+        """SELECT observation_id, sample_date, determinand_code, determinand_label, result_value, simple_result, unit_label, is_outlier
            FROM chemistry_observations WHERE site_notation = ? ORDER BY sample_date""",
         [notation],
     )
@@ -273,12 +276,11 @@ async def recompute_quality_stats(db, notation: str) -> None:
             ],
         ))
 
-        statements.append(("UPDATE chemistry_observations SET is_outlier = 0 WHERE site_notation = ? AND determinand_code = ?", [notation, code]))
         for o, flagged in zip(numeric, outlier_flags):
-            if flagged:
+            if flagged != bool(o["is_outlier"]):
                 statements.append((
-                    "UPDATE chemistry_observations SET is_outlier = 1 WHERE site_notation = ? AND observation_id = ?",
-                    [notation, o["observation_id"]],
+                    "UPDATE chemistry_observations SET is_outlier = ? WHERE site_notation = ? AND observation_id = ?",
+                    [int(flagged), notation, o["observation_id"]],
                 ))
 
     await db.batch(statements)
