@@ -22,6 +22,8 @@ import { fetchLevelTimeseries, fetchQualityTimeseries } from "@/lib/api";
 interface Props {
   site: SiteSummary;
   onClose: () => void;
+  expanded: boolean;
+  onToggleExpand: () => void;
 }
 
 const QUALITY_LABEL_STYLES: Record<string, string> = {
@@ -80,7 +82,7 @@ function StatsSummary({ stat, unit }: { stat: SiteStats; unit?: string | null })
   );
 }
 
-export default function SitePanel({ site, onClose }: Props) {
+export default function SitePanel({ site, onClose, expanded, onToggleExpand }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [syncPending, setSyncPending] = useState(false);
@@ -146,20 +148,28 @@ export default function SitePanel({ site, onClose }: Props) {
 
   const currentQualityStat = qualityStats.find((s) => s.determinand_code === selectedDeterminand);
 
-  return (
-    <div className="flex h-full w-full flex-col gap-3 overflow-y-auto p-4">
-      <div className="flex items-start justify-between gap-2">
-        <div>
-          <span
-            className={`inline-block rounded px-2 py-0.5 text-xs font-medium text-white ${
-              site.type === "level" ? "bg-blue-600" : "bg-green-600"
-            }`}
-          >
-            {site.type === "level" ? "Level station" : "Quality sampling point"}
-          </span>
-          <h2 className="mt-1 text-lg font-semibold leading-tight">{site.label}</h2>
-          <p className="text-xs text-gray-500">{site.id}</p>
-        </div>
+  const header = (
+    <div className={`flex items-start justify-between gap-2 ${expanded ? "border-b border-gray-200 p-4" : ""}`}>
+      <div>
+        <span
+          className={`inline-block rounded px-2 py-0.5 text-xs font-medium text-white ${
+            site.type === "level" ? "bg-blue-600" : "bg-green-600"
+          }`}
+        >
+          {site.type === "level" ? "Level station" : "Quality sampling point"}
+        </span>
+        <h2 className={expanded ? "mt-1 text-2xl font-semibold leading-tight" : "mt-1 text-lg font-semibold leading-tight"}>
+          {site.label}
+        </h2>
+        <p className="text-xs text-gray-500">{site.id}</p>
+      </div>
+      <div className="flex items-center gap-1">
+        <button
+          onClick={onToggleExpand}
+          className="rounded px-2 py-1 text-xs font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+        >
+          {expanded ? "Collapse" : "Expand"}
+        </button>
         <button
           onClick={onClose}
           className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
@@ -168,7 +178,11 @@ export default function SitePanel({ site, onClose }: Props) {
           ✕
         </button>
       </div>
+    </div>
+  );
 
+  const statusMessages = (
+    <>
       {loading && <p className="text-sm text-gray-500">Loading time series...</p>}
       {error && <p className="text-sm text-red-600">{error}</p>}
       {!loading && !error && syncPending && (
@@ -177,68 +191,106 @@ export default function SitePanel({ site, onClose }: Props) {
           slowly to load right now. It will be available after the next nightly refresh.
         </p>
       )}
+    </>
+  );
 
-      {!loading && !error && site.type === "quality" && (
-        <div>
-          <label className="mb-1 block text-xs font-medium text-gray-600">Determinand</label>
-          <select
-            className="w-full rounded border border-gray-300 p-1.5 text-sm"
-            value={selectedDeterminand ?? ""}
-            onChange={(e) => setSelectedDeterminand(e.target.value)}
-          >
-            {determinands.map((d) => (
-              <option key={d.determinand_code} value={d.determinand_code}>
-                {d.determinand_label}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
+  const determinandSelector = !loading && !error && site.type === "quality" && (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-gray-600">Determinand</label>
+      <select
+        className="w-full rounded border border-gray-300 p-1.5 text-sm"
+        value={selectedDeterminand ?? ""}
+        onChange={(e) => setSelectedDeterminand(e.target.value)}
+      >
+        {determinands.map((d) => (
+          <option key={d.determinand_code} value={d.determinand_code}>
+            {d.determinand_label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
 
+  const statsBlock = (
+    <>
       {!loading && !error && site.type === "level" && levelStats && (
         <StatsSummary stat={levelStats} unit="mAOD" />
       )}
       {!loading && !error && site.type === "quality" && currentQualityStat && (
         <StatsSummary stat={currentQualityStat} unit={currentUnit} />
       )}
+    </>
+  );
 
-      {!loading && !error && !syncPending && chartData.length === 0 && (
-        <p className="text-sm text-gray-500">No numeric readings available to plot.</p>
-      )}
-
-      {!loading && !error && chartData.length > 0 && (
-        <div className="h-72 w-full">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={chartData} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-              <XAxis dataKey="date" tick={{ fontSize: 10 }} minTickGap={30} />
-              <YAxis
-                tick={{ fontSize: 10 }}
-                label={{ value: currentUnit ?? "", angle: -90, position: "insideLeft", fontSize: 11 }}
-              />
-              <Tooltip />
-              <Line
-                type="monotone"
-                dataKey="value"
-                stroke={site.type === "level" ? "#2563eb" : "#16a34a"}
-                strokeWidth={1.5}
-                dot={(props) => {
-                  const { key, cx, cy, payload } = props;
-                  if (!payload.isOutlier) return <span key={key} />;
-                  return <circle key={key} cx={cx} cy={cy} r={4} fill="#dc2626" stroke="#dc2626" />;
-                }}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-
+  const footerText = (
+    <>
       {!loading && !error && site.type === "quality" && (
         <p className="text-xs text-gray-400">{observations.length} total observations across {determinands.length} determinands.</p>
       )}
       {!loading && !error && site.type === "level" && (
         <p className="text-xs text-gray-400">{levelReadings.length} readings.</p>
       )}
+    </>
+  );
+
+  const chart = !loading && !error && chartData.length > 0 && (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={chartData} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+        <XAxis dataKey="date" tick={{ fontSize: 10 }} minTickGap={30} />
+        <YAxis
+          tick={{ fontSize: 10 }}
+          label={{ value: currentUnit ?? "", angle: -90, position: "insideLeft", fontSize: 11 }}
+        />
+        <Tooltip />
+        <Line
+          type="monotone"
+          dataKey="value"
+          stroke={site.type === "level" ? "#2563eb" : "#16a34a"}
+          strokeWidth={1.5}
+          dot={(props) => {
+            const { key, cx, cy, payload } = props;
+            if (!payload.isOutlier) return <span key={key} />;
+            return <circle key={key} cx={cx} cy={cy} r={4} fill="#dc2626" stroke="#dc2626" />;
+          }}
+        />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+
+  const emptyChartMessage = !loading && !error && !syncPending && chartData.length === 0 && (
+    <p className="text-sm text-gray-500">No numeric readings available to plot.</p>
+  );
+
+  if (expanded) {
+    return (
+      <div className="flex h-full w-full flex-col">
+        {header}
+        <div className="flex flex-1 gap-6 overflow-hidden p-4">
+          <div className="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto">
+            {statusMessages}
+            {determinandSelector}
+            {statsBlock}
+            {footerText}
+          </div>
+          <div className="flex min-w-0 flex-1 flex-col">
+            {emptyChartMessage}
+            {chart && <div className="min-h-0 flex-1">{chart}</div>}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full w-full flex-col gap-3 overflow-y-auto p-4">
+      {header}
+      {statusMessages}
+      {determinandSelector}
+      {statsBlock}
+      {emptyChartMessage}
+      {chart && <div className="h-72 w-full">{chart}</div>}
+      {footerText}
     </div>
   );
 }

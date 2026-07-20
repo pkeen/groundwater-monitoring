@@ -12,6 +12,7 @@ export default function Home() {
   const [allSites, setAllSites] = useState<SiteSummary[]>([]);
   const [visibleSites, setVisibleSites] = useState<SiteSummary[]>([]);
   const [selected, setSelected] = useState<SiteSummary | null>(null);
+  const [panelExpanded, setPanelExpanded] = useState(false);
   const [flyTo, setFlyTo] = useState<[number, number] | null>(null);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
@@ -106,8 +107,22 @@ export default function Home() {
           />
         </div>
         {selected && (
-          <div className="w-96 shrink-0 border-l border-gray-200 bg-white shadow-lg">
-            <SitePanel site={selected} onClose={() => setSelected(null)} />
+          <div
+            className={
+              panelExpanded
+                ? "absolute inset-0 z-[1000] bg-white shadow-lg"
+                : "w-96 shrink-0 border-l border-gray-200 bg-white shadow-lg"
+            }
+          >
+            <SitePanel
+              site={selected}
+              onClose={() => {
+                setSelected(null);
+                setPanelExpanded(false);
+              }}
+              expanded={panelExpanded}
+              onToggleExpand={() => setPanelExpanded((e) => !e)}
+            />
           </div>
         )}
       </div>
