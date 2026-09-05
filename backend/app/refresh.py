@@ -2,19 +2,17 @@
 hand locally: `python -m app.refresh`).
 
 Three phases:
-  1. Re-sync site registries (cheap, catches new/closed sites).
+  1. Re-sync site registries (cheap, catches new/closed sites) into D1.
   2. Incrementally fetch new readings/observations per site, since whatever
      `site_sync_state.latest_data_date` says (or the last `HISTORY_CAP_YEARS`
      on first run), with bounded concurrency so a full ~9,200-site backfill
-     is tractable.
+     is tractable. Readings/observations are merged into each site's Parquet
+     file on R2 (see app/parquet_store.py) - D1 only holds the small
+     site_sync_state bookkeeping row per site.
   3. Recompute summary stats/trend/outlier flags, but only for sites that
      actually received new readings/observations this run - a site with no
      new data has an unchanged series, so its cached stats are still
-     correct. This matters because Turso bills UPDATEs by rows affected:
-     recomputing a site rewrites `is_outlier` across its *entire* reading
-     history, so doing this unconditionally for every ever-synced site,
-     every night, silently burns through the row-write quota regardless of
-     how much new data actually arrived.
+     correct.
 """
 import asyncio
 import json
@@ -26,8 +24,8 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import stats
-from app.db import get_client, init_db
+from app import parquet_store, stats
+from app.d1 import get_client, init_db
 from app.ea_client import fetch_chemistry_observations, fetch_level_readings, history_cutoff_date, now_iso
 from app.ingest import ingest_level_stations, ingest_quality_sites
 
@@ -102,14 +100,7 @@ async def sync_level_station(
             readings = await fetch_level_readings(http_client, notation, since=since)
             limiter.record_success()
             if readings:
-                statements = [
-                    (
-                        "INSERT OR REPLACE INTO level_readings (station_notation, date_time, value, quality) VALUES (?,?,?,?)",
-                        [notation, r["date_time"], r["value"], r["quality"]],
-                    )
-                    for r in readings
-                ]
-                await db.batch(statements)
+                await asyncio.to_thread(parquet_store.merge_level_readings, notation, readings)
                 latest = max(r["date_time"] for r in readings if r["date_time"])
                 await set_sync_state(db, notation, "level", latest)
             else:
@@ -136,26 +127,7 @@ async def sync_quality_site(
             observations = await fetch_chemistry_observations(http_client, notation, since=since)
             limiter.record_success()
             if observations:
-                statements = [
-                    (
-                        """INSERT OR REPLACE INTO chemistry_observations
-                           (site_notation, observation_id, sample_date, determinand_code, determinand_label,
-                            result_value, simple_result, unit_label)
-                           VALUES (?,?,?,?,?,?,?,?)""",
-                        [
-                            notation,
-                            o["observation_id"],
-                            o["sample_date"],
-                            o["determinand_code"],
-                            o["determinand_label"],
-                            o["result_value"],
-                            o["simple_result"],
-                            o["unit_label"],
-                        ],
-                    )
-                    for o in observations
-                ]
-                await db.batch(statements)
+                await asyncio.to_thread(parquet_store.merge_chemistry_observations, notation, observations)
                 latest = max(o["sample_date"] for o in observations if o["sample_date"])
                 await set_sync_state(db, notation, "quality", latest)
             else:
@@ -214,76 +186,63 @@ async def sync_all_readings() -> tuple[set[str], set[str]]:
 
 
 async def recompute_level_stats(db, notation: str) -> None:
-    rs = await db.execute(
-        "SELECT date_time, value, is_outlier FROM level_readings WHERE station_notation = ? AND value IS NOT NULL ORDER BY date_time",
-        [notation],
-    )
-    rows = [r.asdict() for r in rs]
-    if not rows:
+    all_rows = await asyncio.to_thread(parquet_store.read_level_readings, notation)
+    numeric = [r for r in all_rows if r["value"] is not None]
+    if not numeric:
         return
-    dates = [r["date_time"] for r in rows]
-    values = [r["value"] for r in rows]
-    stored_outlier = [bool(r["is_outlier"]) for r in rows]
+    dates = [r["date_time"] for r in numeric]
+    values = [r["value"] for r in numeric]
 
     summary = stats.summarize(values)
     trend = stats.trend(dates, values)
     outlier_flags = stats.detect_outliers(values)
     quality = stats.data_quality_flags(
-        count=len(rows),
+        count=len(numeric),
         censored_count=0,
         latest_date=dates[-1],
         stale_days_threshold=stats.STALE_DAYS_LEVEL,
     )
 
-    statements = [
-        (
-            """INSERT INTO level_station_stats
-               (station_notation, count, min_value, max_value, mean_value, median_value, stddev_value,
-                latest_value, latest_date, first_date, trend_direction, trend_slope_per_year, trend_p_value,
-                outlier_count, data_quality_label, data_quality_flags, last_computed)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT (station_notation) DO UPDATE SET
-                 count=excluded.count, min_value=excluded.min_value, max_value=excluded.max_value,
-                 mean_value=excluded.mean_value, median_value=excluded.median_value, stddev_value=excluded.stddev_value,
-                 latest_value=excluded.latest_value, latest_date=excluded.latest_date, first_date=excluded.first_date,
-                 trend_direction=excluded.trend_direction, trend_slope_per_year=excluded.trend_slope_per_year,
-                 trend_p_value=excluded.trend_p_value, outlier_count=excluded.outlier_count,
-                 data_quality_label=excluded.data_quality_label, data_quality_flags=excluded.data_quality_flags,
-                 last_computed=excluded.last_computed""",
-            [
-                notation, summary["count"], summary["min_value"], summary["max_value"], summary["mean_value"],
-                summary["median_value"], summary["stddev_value"], values[-1], dates[-1], dates[0],
-                trend["trend_direction"], trend["trend_slope_per_year"], trend["trend_p_value"],
-                sum(outlier_flags), quality["label"], json.dumps(quality), now_iso(),
-            ],
-        ),
+    await db.execute(
+        """INSERT INTO level_station_stats
+           (station_notation, count, min_value, max_value, mean_value, median_value, stddev_value,
+            latest_value, latest_date, first_date, trend_direction, trend_slope_per_year, trend_p_value,
+            outlier_count, data_quality_label, data_quality_flags, last_computed)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT (station_notation) DO UPDATE SET
+             count=excluded.count, min_value=excluded.min_value, max_value=excluded.max_value,
+             mean_value=excluded.mean_value, median_value=excluded.median_value, stddev_value=excluded.stddev_value,
+             latest_value=excluded.latest_value, latest_date=excluded.latest_date, first_date=excluded.first_date,
+             trend_direction=excluded.trend_direction, trend_slope_per_year=excluded.trend_slope_per_year,
+             trend_p_value=excluded.trend_p_value, outlier_count=excluded.outlier_count,
+             data_quality_label=excluded.data_quality_label, data_quality_flags=excluded.data_quality_flags,
+             last_computed=excluded.last_computed""",
+        [
+            notation, summary["count"], summary["min_value"], summary["max_value"], summary["mean_value"],
+            summary["median_value"], summary["stddev_value"], values[-1], dates[-1], dates[0],
+            trend["trend_direction"], trend["trend_slope_per_year"], trend["trend_p_value"],
+            sum(outlier_flags), quality["label"], json.dumps(quality), now_iso(),
+        ],
+    )
+
+    outlier_by_date = {d: int(flagged) for d, flagged in zip(dates, outlier_flags)}
+    updated_rows = [
+        {**r, "is_outlier": outlier_by_date.get(r["date_time"], r["is_outlier"])}
+        for r in all_rows
     ]
-    statements += [
-        (
-            "UPDATE level_readings SET is_outlier = ? WHERE station_notation = ? AND date_time = ?",
-            [int(flagged), notation, d],
-        )
-        for d, flagged, was_flagged in zip(dates, outlier_flags, stored_outlier)
-        if flagged != was_flagged
-    ]
-    await db.batch(statements)
+    await asyncio.to_thread(parquet_store.write_level_readings, notation, updated_rows)
 
 
 async def recompute_quality_stats(db, notation: str) -> None:
-    rs = await db.execute(
-        """SELECT observation_id, sample_date, determinand_code, determinand_label, result_value, simple_result, unit_label, is_outlier
-           FROM chemistry_observations WHERE site_notation = ? ORDER BY sample_date""",
-        [notation],
-    )
-    rows = [r.asdict() for r in rs]
-    if not rows:
+    all_rows = await asyncio.to_thread(parquet_store.read_chemistry_observations, notation)
+    if not all_rows:
         return
 
     by_determinand: dict[str, list[dict]] = {}
-    for r in rows:
+    for r in all_rows:
         by_determinand.setdefault(r["determinand_code"], []).append(r)
 
-    statements = []
+    outlier_by_id: dict[str, int] = {}
     for code, obs in by_determinand.items():
         label = obs[0]["determinand_label"]
         unit = obs[0]["unit_label"]
@@ -304,7 +263,7 @@ async def recompute_quality_stats(db, notation: str) -> None:
             stale_days_threshold=stats.STALE_DAYS_QUALITY,
         )
 
-        statements.append((
+        await db.execute(
             """INSERT INTO quality_site_stats
                (site_notation, determinand_code, determinand_label, unit_label, count, censored_count,
                 min_value, max_value, mean_value, median_value, stddev_value, latest_value, latest_date,
@@ -328,22 +287,22 @@ async def recompute_quality_stats(db, notation: str) -> None:
                 trend["trend_direction"], trend["trend_slope_per_year"], trend["trend_p_value"],
                 sum(outlier_flags), quality["label"], json.dumps(quality), now_iso(),
             ],
-        ))
+        )
 
         for o, flagged in zip(numeric, outlier_flags):
-            if flagged != bool(o["is_outlier"]):
-                statements.append((
-                    "UPDATE chemistry_observations SET is_outlier = ? WHERE site_notation = ? AND observation_id = ?",
-                    [int(flagged), notation, o["observation_id"]],
-                ))
+            outlier_by_id[o["observation_id"]] = int(flagged)
 
-    await db.batch(statements)
+    updated_rows = [
+        {**r, "is_outlier": outlier_by_id.get(r["observation_id"], r["is_outlier"])}
+        for r in all_rows
+    ]
+    await asyncio.to_thread(parquet_store.write_chemistry_observations, notation, updated_rows)
 
 
 async def recompute_all_stats(updated_level: set[str], updated_quality: set[str]) -> None:
     """Only recomputes sites that received new readings/observations this
     run - see the module docstring for why recomputing untouched sites is
-    both wasted work and a quota hazard."""
+    wasted work."""
     db = get_client()
     try:
         level_notations = sorted(updated_level)

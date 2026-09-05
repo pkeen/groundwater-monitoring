@@ -1,7 +1,8 @@
+duckdb==1.5.5
 fastapi==0.139.0
 httpx==0.28.1
-libsql-client==0.3.1
 numpy==2.5.1
+pyarrow==25.0.1
 pydantic==2.13.4
 pydantic_core==2.46.4
 pymannkendall==1.4.3

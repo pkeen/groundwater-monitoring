@@ -12,7 +12,7 @@ import asyncio
 
 import httpx
 
-from app.db import get_client, init_db
+from app.d1 import get_client, init_db
 
 HYDROLOGY_BASE = "https://environment.data.gov.uk/hydrology"
 WQ_BASE = "https://environment.data.gov.uk/water-quality"

@@ -10,8 +10,11 @@ backend runs statistical trend and outlier detection over each site's full
 history so you can see at a glance whether a borehole is rising, falling, or
 behaving erratically.
 
-- **Backend**: FastAPI + SQLite/[Turso](https://turso.tech) (libSQL), deployed
-  as a Vercel serverless function
+- **Backend**: FastAPI, deployed as a Vercel serverless function. Site/stats
+  metadata lives in [Cloudflare D1](https://developers.cloudflare.com/d1/);
+  time-series readings are per-site [Parquet](https://parquet.apache.org/)
+  files on [Cloudflare R2](https://developers.cloudflare.com/r2/), queried
+  with [DuckDB](https://duckdb.org/)
 - **Frontend**: Next.js + React-Leaflet + Recharts, deployed on Vercel
 - **Data**: [EA Hydrology API](https://environment.data.gov.uk/hydrology/doc/reference)
   and [EA Water Quality Archive API](https://environment.data.gov.uk/water-quality/api-docs)
@@ -56,8 +59,10 @@ backend/    FastAPI app — site registry, time series, stats endpoints
 ```
 
 Time-series readings are fetched from the EA APIs once per site and cached
-in the database from then on; the nightly refresh job tops these up
-incrementally rather than re-downloading full history each time.
+as a Parquet file on R2 from then on; the nightly refresh job tops these up
+incrementally rather than re-downloading full history each time. Level
+readings are downsampled to daily resolution on fetch (some stations only
+expose sub-daily logged data upstream).
 
 ## Running locally
 
@@ -71,9 +76,9 @@ venv/bin/python -m app.ingest              # populates the site registry
 venv/bin/uvicorn app.main:app --port 8000 --reload
 ```
 
-By default this uses a local SQLite file (`backend/data/groundwater.db`).
-To point at a Turso database instead, set `TURSO_DATABASE_URL` and
-`TURSO_AUTH_TOKEN` in `backend/.env`.
+Requires Cloudflare D1 + R2 credentials in `backend/.env`:
+`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `D1_DATABASE_ID`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`.
 
 ### Frontend
 

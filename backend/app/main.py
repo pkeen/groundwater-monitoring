@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import json
 import math
 import os
@@ -8,8 +9,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import stats
-from app.db import get_client, init_db
+from app import parquet_store, stats
+from app.d1 import get_client, init_db
 from app.ea_client import fetch_chemistry_observations, fetch_level_readings, history_cutoff_date
 
 
@@ -128,11 +129,7 @@ async def get_level_timeseries(notation: str):
         await db.close()
         raise HTTPException(404, "Station not found")
 
-    readings_rs = await db.execute(
-        "SELECT date_time, value, quality, is_outlier FROM level_readings WHERE station_notation = ? ORDER BY date_time",
-        [notation],
-    )
-    readings = [r.asdict() for r in readings_rs]
+    readings = await asyncio.to_thread(parquet_store.read_level_readings, notation)
     stats_rs = await db.execute("SELECT * FROM level_station_stats WHERE station_notation = ?", [notation])
     site_stats = _flatten_stats_row(stats_rs[0].asdict()) if len(stats_rs) else None
     await db.close()
@@ -218,20 +215,20 @@ async def get_quality_timeseries(notation: str):
         await db.close()
         raise HTTPException(404, "Site not found")
 
-    obs_rs = await db.execute(
-        """SELECT observation_id, sample_date, determinand_code, determinand_label,
-                  result_value, simple_result, unit_label, is_outlier
-           FROM chemistry_observations WHERE site_notation = ? ORDER BY sample_date""",
-        [notation],
-    )
-    observations = [r.asdict() for r in obs_rs]
+    observations = await asyncio.to_thread(parquet_store.read_chemistry_observations, notation)
 
-    determinands_rs = await db.execute(
-        """SELECT DISTINCT determinand_code, determinand_label, unit_label
-           FROM chemistry_observations WHERE site_notation = ? ORDER BY determinand_label""",
-        [notation],
+    seen_determinands = {}
+    for o in observations:
+        seen_determinands.setdefault(
+            o["determinand_code"], {"label": o["determinand_label"], "unit": o["unit_label"]}
+        )
+    determinands = sorted(
+        (
+            {"determinand_code": code, "determinand_label": v["label"], "unit_label": v["unit"]}
+            for code, v in seen_determinands.items()
+        ),
+        key=lambda d: d["determinand_label"] or "",
     )
-    determinands = [r.asdict() for r in determinands_rs]
 
     stats_rs = await db.execute("SELECT * FROM quality_site_stats WHERE site_notation = ?", [notation])
     site_stats = [_flatten_stats_row(r.asdict()) for r in stats_rs]

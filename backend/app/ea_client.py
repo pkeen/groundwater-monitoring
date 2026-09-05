@@ -23,6 +23,32 @@ def history_cutoff_date() -> str:
     return (datetime.now(timezone.utc) - timedelta(days=365 * HISTORY_CAP_YEARS)).date().isoformat()
 
 
+def _downsample_daily(readings: list[dict]) -> list[dict]:
+    """Collapse readings to one value per calendar day (mean of that day's
+    values). Stations with a dipped/daily measure already have ~1 reading/day
+    so this is a no-op for them; stations that only expose sub-daily (e.g.
+    15-min logged) data would otherwise accumulate tens of thousands of rows
+    per year - see the incident where level_readings tripled to 88M+ rows for
+    the same ~3,600 stations."""
+    by_date: dict[str, list[dict]] = {}
+    for r in readings:
+        if not r.get("date_time"):
+            continue
+        by_date.setdefault(r["date_time"][:10], []).append(r)
+
+    downsampled = []
+    for date, day_readings in sorted(by_date.items()):
+        values = [r["value"] for r in day_readings if r["value"] is not None]
+        downsampled.append(
+            {
+                "date_time": date,
+                "value": (sum(values) / len(values)) if values else None,
+                "quality": day_readings[-1]["quality"],
+            }
+        )
+    return downsampled
+
+
 def pick_level_measure(measures: list[dict]) -> dict | None:
     """Prefer sparser, human-scale readings (dipped/daily) over subdaily logged
     data so a browser chart doesn't choke on tens of thousands of points."""
@@ -81,7 +107,7 @@ async def fetch_level_readings(
             break
         if offset >= 50000:  # safety cap
             break
-    return readings
+    return _downsample_daily(readings)
 
 
 async def fetch_chemistry_observations(
