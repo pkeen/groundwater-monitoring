@@ -11,6 +11,7 @@ const GroundwaterMap = dynamic(() => import("@/components/GroundwaterMap"), { ss
 export default function Home() {
   const [allSites, setAllSites] = useState<SiteSummary[]>([]);
   const [visibleSites, setVisibleSites] = useState<SiteSummary[]>([]);
+  const [sitesLoading, setSitesLoading] = useState(true);
   const [selected, setSelected] = useState<SiteSummary | null>(null);
   const [panelExpanded, setPanelExpanded] = useState(false);
   const [flyTo, setFlyTo] = useState<[number, number] | null>(null);
@@ -24,7 +25,8 @@ export default function Home() {
         setAllSites(sites);
         setVisibleSites(sites);
       })
-      .catch(() => setSearchError("Could not load sites from the API."));
+      .catch(() => setSearchError("Could not load sites from the API."))
+      .finally(() => setSitesLoading(false));
   }, []);
 
   async function handleNameSearch(query: string) {
@@ -98,13 +100,22 @@ export default function Home() {
       </header>
 
       <div className="relative flex flex-1 overflow-hidden">
-        <div className="flex-1">
+        <div className="relative flex-1">
           <GroundwaterMap
             sites={visibleSites}
             selectedId={selected?.id ?? null}
             onSelect={setSelected}
             flyToCenter={flyTo}
           />
+          {sitesLoading && (
+            <div className="absolute inset-0 z-[500] flex items-center justify-center bg-white/70 backdrop-blur-sm">
+              <div className="flex flex-col items-center gap-3 rounded-lg bg-white px-6 py-5 shadow-lg">
+                <div className="h-8 w-8 animate-spin rounded-full border-2 border-gray-200 border-t-blue-600" />
+                <p className="text-sm font-medium text-gray-700">Loading monitoring sites&hellip;</p>
+                <p className="text-xs text-gray-500">Fetching boreholes and sampling points across England</p>
+              </div>
+            </div>
+          )}
         </div>
         {selected && (
           <div
