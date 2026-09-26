@@ -43,7 +43,9 @@ CHEMISTRY_OBSERVATIONS_SCHEMA = pa.schema(
 
 
 def _connection() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
+    # Vercel's serverless runtime has no $HOME (only /tmp is writable), but
+    # DuckDB needs a home directory to cache the httpfs extension in.
+    con = duckdb.connect(config={"home_directory": "/tmp"})
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute(
         """
